@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
 import OpenClawChatUI
 import OpenClawKit
@@ -32,7 +32,26 @@ actor TalkModeRuntime {
     }
 
     private var recognizer: SFSpeechRecognizer?
-    private var audioEngine: AVAudioEngine?
+
+    // Single engine that lives for the full actor lifetime. Both the mic tap
+    // (SFSpeech input) and the audio players route through this one engine so
+    // that setVoiceProcessingEnabled can perform hardware AEC — it requires
+    // input and output to share the same engine.
+    private let sharedEngine = AVAudioEngine()
+    // Tracks whether setVoiceProcessingEnabled(true) has already been called.
+    // It must be called while the engine is stopped and cannot be changed while
+    // running, so we guard with this flag and call it at most once.
+    private var voiceProcessingEnabled = false
+
+    // Per-session players created lazily on first start() and reused across
+    // enable/disable cycles. Declared nonisolated(unsafe) because they are
+    // @MainActor-isolated types but accessed only from @MainActor helpers
+    // (playPCM/playMP3/stopPCM/stopMP3) and from MainActor.run blocks in
+    // start(). All access is serialised on MainActor — the keyword opts out
+    // of actor isolation in exchange for that manual guarantee.
+    nonisolated(unsafe) private var pcmPlayer: PCMStreamingAudioPlayer?
+    nonisolated(unsafe) private var mp3Player: StreamingAudioPlayer?
+
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionGeneration: Int = 0
@@ -129,6 +148,22 @@ actor TalkModeRuntime {
         }
         await self.startRecognition()
         guard self.isCurrent(gen) else { return }
+
+        // Create per-session players the first time start() is reached.
+        // We capture the engine reference here (actor context) and hand it to
+        // the @MainActor constructors. Players are intentionally kept alive
+        // across disable/re-enable cycles — their nodes stay attached to the
+        // engine, and the engine graph persists across stop/start.
+        let engine = self.sharedEngine
+        await MainActor.run {
+            if self.pcmPlayer == nil {
+                self.pcmPlayer = PCMStreamingAudioPlayer(sharedEngine: engine)
+            }
+            if self.mp3Player == nil {
+                self.mp3Player = StreamingAudioPlayer(sharedEngine: engine)
+            }
+        }
+
         self.phase = .listening
         await MainActor.run { TalkModeController.shared.updatePhase(.listening) }
         self.startSilenceMonitor()
@@ -148,6 +183,12 @@ actor TalkModeRuntime {
         self.lastSpeechEnergyAt = nil
         self.phase = .idle
         await self.stopRecognition()
+        // Full engine stop. stopSpeaking() above already stopped any active
+        // playback; stopRecognition() removed the mic tap. Stopping here lets
+        // setVoiceProcessingEnabled be called again if the device changes
+        // before the next start(). Players are intentionally NOT nilled —
+        // their nodes stay in the engine graph and will work on the next start.
+        self.sharedEngine.stop()
         await MainActor.run {
             TalkModeController.shared.updateLevel(0)
             TalkModeController.shared.updatePhase(.idle)
@@ -162,6 +203,7 @@ actor TalkModeRuntime {
         let isFinal: Bool
         let errorDescription: String?
         let generation: Int
+        let confidences: [Float]
     }
 
     private func startRecognition() async {
@@ -180,18 +222,12 @@ actor TalkModeRuntime {
         self.recognitionRequest?.shouldReportPartialResults = true
         guard let request = self.recognitionRequest else { return }
 
-        if self.audioEngine == nil {
-            self.audioEngine = AVAudioEngine()
-        }
-        guard let audioEngine = self.audioEngine else { return }
-
         guard AudioInputDeviceObserver.hasUsableDefaultInputDevice() else {
-            self.audioEngine = nil
             self.logger.error("talk mode: no usable audio input device")
             return
         }
 
-        let input = audioEngine.inputNode
+        let input = self.sharedEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         input.removeTap(onBus: 0)
         let meter = self.rmsMeter
@@ -202,12 +238,29 @@ actor TalkModeRuntime {
             }
         }
 
-        audioEngine.prepare()
-        do {
-            try audioEngine.start()
-        } catch {
-            self.logger.error("talk audio engine start failed: \(error.localizedDescription, privacy: .public)")
-            return
+        // Start the engine only if it is not already running. It stays alive
+        // while players are outputting audio between recognition cycles —
+        // stopping and restarting it would cut off in-flight TTS playback.
+        if !self.sharedEngine.isRunning {
+            // setVoiceProcessingEnabled must be called while the engine is
+            // stopped. The flag prevents calling it a second time (the API
+            // ignores repeat calls, but being explicit avoids potential errors
+            // on some hardware).
+            do {
+                try self.enableVoiceProcessingIfNeeded()
+            } catch {
+                // Non-fatal: AEC unavailable (e.g. external audio interface).
+                self.logger.error(
+                    "talk voice processing enable failed: \(error.localizedDescription, privacy: .public)")
+            }
+            self.sharedEngine.prepare()
+            do {
+                try self.sharedEngine.start()
+            } catch {
+                self.logger.error(
+                    "talk audio engine start failed: \(error.localizedDescription, privacy: .public)")
+                return
+            }
         }
 
         self.startRMSTicker(meter: meter)
@@ -221,7 +274,8 @@ actor TalkModeRuntime {
                 hasConfidence: segments.contains { $0.confidence > 0.6 },
                 isFinal: result?.isFinal ?? false,
                 errorDescription: error?.localizedDescription,
-                generation: generation)
+                generation: generation,
+                confidences: segments.map(\.confidence))
             Task { await self.handleRecognition(update) }
         }
     }
@@ -232,12 +286,23 @@ actor TalkModeRuntime {
         self.recognitionTask = nil
         self.recognitionRequest?.endAudio()
         self.recognitionRequest = nil
-        self.audioEngine?.inputNode.removeTap(onBus: 0)
-        self.audioEngine?.stop()
-        self.audioEngine = nil
+        // Remove the mic tap so buffers stop being fed to the recogniser.
+        // The engine itself keeps running — output players may still be active
+        // and must not be interrupted. The engine is only stopped in stop().
+        self.sharedEngine.inputNode.removeTap(onBus: 0)
         self.recognizer = nil
         self.rmsTask?.cancel()
         self.rmsTask = nil
+    }
+
+    /// Enables hardware-level AEC on the shared engine's input node.
+    /// Must be called while the engine is stopped. Safe to call from any
+    /// actor context. Errors are non-fatal — some hardware (e.g. external
+    /// audio interfaces) does not support voice processing.
+    private func enableVoiceProcessingIfNeeded() throws {
+        guard !voiceProcessingEnabled else { return }
+        try sharedEngine.inputNode.setVoiceProcessingEnabled(true)
+        voiceProcessingEnabled = true
     }
 
     private func startRMSTicker(meter: RMSMeter) {
@@ -260,8 +325,14 @@ actor TalkModeRuntime {
         guard let transcript = update.transcript else { return }
 
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let phaseStr = String(describing: self.phase)
+        self.logger.notice("talk speech-update phase=\(phaseStr, privacy: .public) trimmedLen=\(trimmed.count, privacy: .public)")
         if self.phase == .speaking, self.interruptOnSpeech {
-            if await self.shouldInterrupt(transcript: trimmed, hasConfidence: update.hasConfidence) {
+            let confidencesStr = update.confidences.map { String(format: "%.2f", $0) }.joined(separator: ",")
+            self.logger.notice("talk interrupt-check transcript='\(trimmed, privacy: .public)' hasConfidence=\(update.hasConfidence, privacy: .public) isFinal=\(update.isFinal, privacy: .public) confidences=\(confidencesStr, privacy: .public)")
+            let decision = await self.shouldInterrupt(transcript: trimmed, hasConfidence: update.hasConfidence)
+            self.logger.notice("talk shouldInterrupt=\(decision, privacy: .public) trimmedLen=\(trimmed.count, privacy: .public)")
+            if decision {
                 await self.stopSpeaking(reason: .speech)
                 self.lastTranscript = ""
                 self.lastHeard = nil
@@ -745,22 +816,30 @@ extension TalkModeRuntime {
         stream: AsyncThrowingStream<Data, Error>,
         sampleRate: Double) async -> StreamingPlaybackResult
     {
-        await PCMStreamingAudioPlayer.shared.play(stream: stream, sampleRate: sampleRate)
+        guard let player = pcmPlayer else {
+            logger.error("talk playPCM: pcmPlayer not initialised")
+            return StreamingPlaybackResult(finished: false, interruptedAt: nil)
+        }
+        return await player.play(stream: stream, sampleRate: sampleRate)
     }
 
     @MainActor
     private func playMP3(stream: AsyncThrowingStream<Data, Error>) async -> StreamingPlaybackResult {
-        await StreamingAudioPlayer.shared.play(stream: stream)
+        guard let player = mp3Player else {
+            logger.error("talk playMP3: mp3Player not initialised")
+            return StreamingPlaybackResult(finished: false, interruptedAt: nil)
+        }
+        return await player.play(stream: stream)
     }
 
     @MainActor
     private func stopPCM() -> Double? {
-        PCMStreamingAudioPlayer.shared.stop()
+        pcmPlayer?.stop()
     }
 
     @MainActor
     private func stopMP3() -> Double? {
-        StreamingAudioPlayer.shared.stop()
+        mp3Player?.stop()
     }
 
     // MARK: - Config
