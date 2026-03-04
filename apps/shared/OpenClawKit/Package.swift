@@ -14,7 +14,7 @@ let package = Package(
         .library(name: "OpenClawChatUI", targets: ["OpenClawChatUI"]),
     ],
     dependencies: [
-        .package(path: "~/openclaw/Leo/ElevenLabsKit"),
+        .package(path: "../ElevenLabsKit"),
         .package(url: "https://github.com/gonzalezreal/textual", exact: "0.3.1"),
     ],
     targets: [

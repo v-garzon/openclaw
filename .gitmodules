@@ -1,0 +1,3 @@
+[submodule "apps/shared/ElevenLabsKit"]
+	path = apps/shared/ElevenLabsKit
+	url = https://github.com/v-garzon/ElevenLabsKit.git
