@@ -37,7 +37,7 @@ actor TalkModeRuntime {
     // (SFSpeech input) and the audio players route through this one engine so
     // that setVoiceProcessingEnabled can perform hardware AEC — it requires
     // input and output to share the same engine.
-    private let sharedEngine = AVAudioEngine()
+    private let sharedEngine: AVAudioEngine
     // Tracks whether setVoiceProcessingEnabled(true) has already been called.
     // It must be called while the engine is stopped and cannot be changed while
     // running, so we guard with this flag and call it at most once.
@@ -94,8 +94,7 @@ actor TalkModeRuntime {
     init() {
         let initLogger = Logger(subsystem: "ai.openclaw", category: "talk.runtime")
         initLogger.info("talk runtime init — start")
-        // sharedEngine is a stored let, already initialized by here.
-        // This log confirms actor construction succeeded.
+        self.sharedEngine = AVAudioEngine()
         initLogger.info("talk runtime init — sharedEngine ok, init complete")
     }
 

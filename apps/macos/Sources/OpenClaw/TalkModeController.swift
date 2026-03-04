@@ -13,11 +13,15 @@ final class TalkModeController {
     func setEnabled(_ enabled: Bool) async {
         self.logger.info("talk enabled=\(enabled)")
         if enabled {
+            self.logger.info("talk controller: presenting overlay")
             TalkOverlayController.shared.present()
+            self.logger.info("talk controller: overlay presented OK")
         } else {
             TalkOverlayController.shared.dismiss()
         }
+        self.logger.info("talk controller: calling runtime.setEnabled")
         await TalkModeRuntime.shared.setEnabled(enabled)
+        self.logger.info("talk controller: runtime.setEnabled returned")
     }
 
     func updatePhase(_ phase: TalkModePhase) {
