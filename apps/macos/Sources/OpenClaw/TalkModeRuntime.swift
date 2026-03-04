@@ -91,6 +91,14 @@ actor TalkModeRuntime {
 
     // MARK: - Lifecycle
 
+    init() {
+        let initLogger = Logger(subsystem: "ai.openclaw", category: "talk.runtime")
+        initLogger.info("talk runtime init — start")
+        // sharedEngine is a stored let, already initialized by here.
+        // This log confirms actor construction succeeded.
+        initLogger.info("talk runtime init — sharedEngine ok, init complete")
+    }
+
     func setEnabled(_ enabled: Bool) async {
         guard enabled != self.isEnabled else { return }
         self.logger.info("talk setEnabled=\(enabled, privacy: .public) gen=\(self.lifecycleGeneration + 1, privacy: .public)")
