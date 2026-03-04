@@ -93,6 +93,7 @@ actor TalkModeRuntime {
 
     func setEnabled(_ enabled: Bool) async {
         guard enabled != self.isEnabled else { return }
+        self.logger.info("talk setEnabled=\(enabled, privacy: .public) gen=\(self.lifecycleGeneration + 1, privacy: .public)")
         self.isEnabled = enabled
         self.lifecycleGeneration &+= 1
         if enabled {
@@ -131,6 +132,7 @@ actor TalkModeRuntime {
 
     private func start() async {
         let gen = self.lifecycleGeneration
+        self.logger.info("talk start gen=\(gen, privacy: .public)")
         guard voiceWakeSupported else { return }
         guard PermissionManager.voiceWakePermissionsGranted() else {
             self.logger.debug("talk runtime not starting: permissions missing")
@@ -158,9 +160,11 @@ actor TalkModeRuntime {
         await MainActor.run {
             if self.pcmPlayer == nil {
                 self.pcmPlayer = PCMStreamingAudioPlayer(sharedEngine: engine)
+                self.logger.info("talk pcmPlayer created (shared engine)")
             }
             if self.mp3Player == nil {
                 self.mp3Player = StreamingAudioPlayer(sharedEngine: engine)
+                self.logger.info("talk mp3Player created (shared engine)")
             }
         }
 
@@ -170,6 +174,7 @@ actor TalkModeRuntime {
     }
 
     private func stop() async {
+        self.logger.info("talk stop gen=\(self.lifecycleGeneration, privacy: .public)")
         self.captureTask?.cancel()
         self.captureTask = nil
         self.silenceTask?.cancel()
@@ -256,11 +261,14 @@ actor TalkModeRuntime {
             self.sharedEngine.prepare()
             do {
                 try self.sharedEngine.start()
+                self.logger.info("talk shared engine started")
             } catch {
                 self.logger.error(
                     "talk audio engine start failed: \(error.localizedDescription, privacy: .public)")
                 return
             }
+        } else {
+            self.logger.info("talk shared engine already running — reusing")
         }
 
         self.startRMSTicker(meter: meter)
@@ -303,6 +311,7 @@ actor TalkModeRuntime {
         guard !voiceProcessingEnabled else { return }
         try sharedEngine.inputNode.setVoiceProcessingEnabled(true)
         voiceProcessingEnabled = true
+        self.logger.info("talk voice processing (AEC) enabled")
     }
 
     private func startRMSTicker(meter: RMSMeter) {
@@ -736,6 +745,7 @@ actor TalkModeRuntime {
     }
 
     private func prepareForPlayback(generation: Int) async -> Bool {
+        self.logger.info("talk prepareForPlayback — restarting recognition before TTS")
         await self.startRecognition()
         return self.isCurrent(generation)
     }
@@ -1069,7 +1079,12 @@ extension TalkModeRuntime {
         if let lastSpeechEnergyAt, now.timeIntervalSince(lastSpeechEnergyAt) > 0.35 {
             return false
         }
-        return hasConfidence
+        // hasConfidence is intentionally not used as a gate here. On macOS,
+        // SFSpeechRecognizer sets segment.confidence = 0 on all partial results
+        // and only populates it on the final result. Using it as a gate means
+        // interrupts are structurally impossible during streaming TTS playback.
+        // hasConfidence is still logged at the call site for diagnostic purposes.
+        return true
     }
 
     private func isLikelyEcho(of transcript: String) -> Bool {
